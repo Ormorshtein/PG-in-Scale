@@ -16,6 +16,8 @@ The recommended architecture is a **Patroni stretched cluster** with:
 
 Async streaming replication runs between Site A and Site B. Patroni manages automatic failover and leader election using the etcd DCS (Distributed Configuration Store).
 
+Site C's role is more than passive storage. If Sites A and B lose their direct connection to each other, both can still reach Site C independently. Each can therefore form a 2-of-3 majority with the witness, so neither side is automatically demoted by the partition alone — the side that holds the etcd leader lock continues as primary. Site C acts as the referee that breaks the tie. Without it, a direct A↔B partition would leave both sides unable to resolve a winner.
+
 ### Why This Is Superior to a 2-Site (4-vs-3) Split
 
 A 7-node etcd cluster split 4-vs-3 between two sites has a critical flaw: etcd requires a strict majority (`n/2 + 1`). If the 4-node site fails, the 3-node site cannot reach a quorum of 4 and freezes entirely — even though it is healthy.
@@ -26,6 +28,22 @@ A 7-node etcd cluster split 4-vs-3 between two sites has a critical flaw: etcd r
 | Single point of failure | 4-node site | None |
 | Cost of third site | Full Postgres node | Tiny etcd witness only |
 | Quorum after any partition | Depends on which side fails | Any two sites form majority |
+
+---
+
+## Standby Cluster vs Stretched Cluster
+
+Understanding the trade-offs between these two approaches explains why the 3-site stretched architecture was chosen.
+
+| Feature | Standby Cluster | Stretched Cluster |
+|---|---|---|
+| Failover | Manual only | Automatic (Patroni) |
+| Cross-site communication | None (replication only) | Shared etcd DCS |
+| Split brain risk | Low (no auto-promote) | Managed by Patroni + fencing |
+| Recovery after partition | Manual reconfiguration | pg_rewind + auto rejoin |
+| Operational complexity | Lower | Higher |
+
+The stretched cluster is preferred when **RTO (Recovery Time Objective)** is important and operator response time cannot be guaranteed. The standby cluster is simpler and safer when full control over switchover timing is required.
 
 ---
 
@@ -43,7 +61,7 @@ In a WAN partition, the side that can form a quorum continues operating. The sid
 
 ### Shared etcd Across Multiple Clusters
 
-Sharing a single etcd cluster between multiple Patroni clusters is supported, but each Patroni cluster must use a unique `scope` name (namespace) to avoid key collisions. This approach increases coupling between clusters — a full etcd outage affects all of them simultaneously.
+This same quorum model applies when etcd is shared across multiple Patroni clusters. Sharing a single etcd cluster is supported, but each Patroni cluster must use a unique `scope` name (namespace) to avoid key collisions. This approach increases coupling between clusters — a full etcd outage affects all of them simultaneously.
 
 ---
 
@@ -66,6 +84,16 @@ A hand-written switchover script would need to independently solve every one of 
 - **Node rebuild** — Automatically reconfiguring nodes that rejoin the cluster after a partition (via `pg_basebackup` or `pg_rewind`).
 - **Network jitter resilience** — Tolerating brief network blips without triggering false failovers.
 
+### Disabling Automatic Failover
+
+Setting `pause: true` effectively disables fencing and the HA apparatus. Patroni will continue reporting state to the DCS but will not act on failures. This means:
+
+- A network partition can produce a split brain with no automatic recovery.
+- Any manually triggered switchover during a partition carries the same risk.
+- The entire safety model depends on operator actions being correct and timely.
+
+This mode should only be used for planned maintenance with a full understanding of the current cluster topology.
+
 ---
 
 ## Preventing Split Brain
@@ -77,16 +105,6 @@ Patroni's protections:
 1. **Leader lock TTL** — The primary must renew its lock at every `loop_wait` interval. If it fails to renew before `ttl` expires, the lock is released.
 2. **Fencing via DCS** — Before promoting, the replica acquires the lock. The old primary cannot renew a lock it no longer holds and must step down.
 3. **retry_timeout** — Short DCS blips are retried for up to `retry_timeout` seconds before any action is taken, preventing failovers caused by momentary jitter.
-
-### Disabling Automatic Failover
-
-Disabling Patroni's `failsafe_mode` or setting `pause: true` effectively disables fencing and the HA apparatus. Patroni will continue reporting state to the DCS but will not act on failures. This means:
-
-- A network partition can produce a split brain with no automatic recovery.
-- Any manually triggered switchover during a partition carries the same risk.
-- The entire safety model depends on operator actions being correct and timely.
-
-This mode should only be used for planned maintenance with a full understanding of the current cluster topology.
 
 ---
 
@@ -125,7 +143,7 @@ Use a manual switchover when the cluster is healthy but you need to redirect cli
 
 ```bash
 patronictl -c /etc/patroni.yml switchover <cluster-name> \
-  --master <site-a-host> \
+  --primary <site-a-host> \
   --candidate <site-b-host> \
   --scheduled now
 ```
@@ -147,18 +165,13 @@ Once the network heals, Patroni automatically resolves this using `pg_rewind`:
 
 Any transactions that were committed only on the old primary (after the divergence) are lost. This is the accepted trade-off of async replication under a network partition.
 
-> **Prerequisite:** `wal_log_hints = on` or data checksums must be enabled for `pg_rewind` to work.
-
----
-
-## Standby Cluster vs Stretched Cluster
-
-| Feature | Standby Cluster | Stretched Cluster |
-|---|---|---|
-| Failover | Manual only | Automatic (Patroni) |
-| Cross-site communication | None (replication only) | Shared etcd DCS |
-| Split brain risk | Low (no auto-promote) | Managed by Patroni + fencing |
-| Recovery after partition | Manual reconfiguration | pg_rewind + auto rejoin |
-| Operational complexity | Lower | Higher |
-
-The stretched cluster is preferred when **RTO (Recovery Time Objective)** is important and operator response time cannot be guaranteed. The standby cluster is simpler and safer when full control over switchover timing is required.
+> **Prerequisites:**
+> - `wal_log_hints = on` or data checksums must be enabled in PostgreSQL.
+> - `use_pg_rewind: true` must be set in `patroni.yml`:
+>
+>   ```yaml
+>   postgresql:
+>     use_pg_rewind: true
+>   ```
+>
+> Without `use_pg_rewind: true`, Patroni falls back to a full `pg_basebackup` to rebuild the diverged node, which is significantly slower.
