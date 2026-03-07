@@ -26,7 +26,7 @@ A 7-node etcd cluster split 4-vs-3 between two sites has a critical flaw: etcd r
 |---|---|---|
 | Survives loss of any single site | No | Yes |
 | Single point of failure | 4-node site | None |
-| Cost of third site | Full Postgres node | Tiny etcd witness only |
+| Cost of third site | N/A (2 sites only) | Tiny etcd witness only |
 | Quorum after any partition | Depends on which side fails | Any two sites form majority |
 
 ---
@@ -175,3 +175,120 @@ Any transactions that were committed only on the old primary (after the divergen
 >   ```
 >
 > Without `use_pg_rewind: true`, Patroni falls back to a full `pg_basebackup` to rebuild the diverged node, which is significantly slower.
+
+---
+
+## Q&A
+
+### 1. Cross-DC Support and Latency Concerns
+
+**Q: Is a stretched cluster supported across data centres? What about latency?**
+
+The stretched cluster architecture described in this document is designed for cross-DC deployment. The key constraint is **etcd**, which uses Raft consensus with default heartbeat intervals of 100ms and election timeouts of 1000ms.
+
+**Latency guidelines:**
+
+| RTT between sites | Suitability | Notes |
+|---|---|---|
+| ≤ 10ms | Ideal | No etcd tuning needed |
+| 10–50ms | Workable | Tune `heartbeat-interval` and `election-timeout` |
+| > 50ms | Not recommended | etcd leader elections become unstable; consider a standby cluster instead |
+
+Our measured baseline RTT between sites is **~10ms**, which falls in the ideal range.
+
+**What about latency peaks?**
+
+The 3-node etcd topology makes peaks significantly less dangerous:
+
+- etcd needs **2 out of 3** nodes for quorum. A write only needs to reach the **fastest responding peer** — the slow node catches up asynchronously.
+- If one link spikes but the other two are healthy, the cluster continues at normal speed.
+- Patroni's timing parameters (`ttl: 60`, `retry_timeout: 15`) mean the failover logic ignores anything shorter than ~15 seconds.
+- With a tuned etcd `election-timeout` (e.g., 5000ms), a latency spike would need to be sustained for several seconds before triggering a leader election.
+
+Peaks would only matter if **two links spike simultaneously** (unlikely with 3 independent sites) or if a spike lasts long enough to cause an etcd leader election.
+
+### 2. Handling Network Blips and Flapping
+
+**Q: How does the system handle momentary network disconnections? Won't clusters flap between sites?**
+
+Patroni is specifically designed to avoid flapping. Multiple layers prevent a brief network blip from triggering an unnecessary failover:
+
+1. **`retry_timeout`** — Patroni retries DCS and PostgreSQL operations for up to `retry_timeout` seconds before taking any action. Short blips are silently absorbed (see [Timing Parameters](#timing-parameters)).
+2. **`ttl` (leader lock expiry)** — The primary's lock must fully expire before any failover begins. With `ttl: 60`, the network must be down for a full minute before the lock is released.
+3. **etcd quorum via 3 sites** — A partition between Site A and Site B does not cause flapping because both sites can still reach the witness (Site C). The side holding the etcd leader lock remains primary. There is no back-and-forth — the lock is the single source of truth (see [Architecture: 3-Site Witness Model](#architecture-3-site-witness-model)).
+4. **Fencing** — Once a failover does occur, the old primary is forcefully demoted and cannot reclaim the lock until it rejoins as a replica. This prevents the "bouncing" behaviour seen in systems without proper fencing (see [Preventing Split Brain](#preventing-split-brain)).
+
+With the recommended WAN tuning (`ttl: 60`, `loop_wait: 15`, `retry_timeout: 15`), outages shorter than ~60 seconds will not trigger a failover at all.
+
+### 3. Data Loss During Failover
+
+**Q: Do we failover at all costs, regardless of potential data loss?**
+
+No. Patroni provides a configurable safety net: **`maximum_lag_on_failover`**.
+
+This parameter defines the maximum replication lag (in bytes) a replica is allowed to have before it can be considered for promotion. If all replicas exceed this threshold, **Patroni will not failover** — it prefers unavailability over data loss.
+
+```yaml
+# patroni.yml
+bootstrap:
+  dcs:
+    maximum_lag_on_failover: 1048576  # 1 MB (default)
+```
+
+**How it works in practice:**
+
+| Scenario | Behaviour |
+|---|---|
+| Replica lag < `maximum_lag_on_failover` | Failover proceeds; replica consumes remaining WAL then promotes |
+| Replica lag > `maximum_lag_on_failover` | Failover is blocked; cluster remains without a primary until the issue is resolved |
+| Graceful switchover (`patronictl switchover`) | Replica catches up fully before promoting — **zero data loss** |
+
+For unplanned failovers (crashes, unexpected outages), `maximum_lag_on_failover` is the safety net. For planned switchovers, Patroni ensures the replica catches up fully before promoting.
+
+For details on how diverged nodes are recovered, see [Timeline Divergence and pg_rewind](#timeline-divergence-and-pg_rewind).
+
+> **Decision required:** The team should agree on an acceptable `maximum_lag_on_failover` value that balances data safety against availability.
+
+> **NEEDS REVIEW:** The following hybrid approach is proposed but has not yet been validated by the team.
+
+**Hybrid approach: async by default, sync before planned switchover**
+
+Instead of running synchronous replication permanently (which adds ~1x RTT write latency), the idea is to:
+
+1. Run in **async mode** during normal operation for maximum write performance.
+2. Before a **planned switchover**, dynamically enable sync replication to guarantee the replica is fully caught up.
+3. Perform the switchover with **zero data loss**.
+4. Switch back to async mode after the switchover completes.
+
+Patroni supports changing `synchronous_mode` at runtime without a restart:
+
+```bash
+# Step 1: Enable sync mode
+patronictl -c /etc/patroni.yml edit-config -s 'synchronous_mode=true'
+# Step 2: Wait for replica to confirm sync
+# Step 3: Switchover
+patronictl -c /etc/patroni.yml switchover <cluster-name>
+# Step 4: Return to async mode
+patronictl -c /etc/patroni.yml edit-config -s 'synchronous_mode=false'
+```
+
+This gives the best of both worlds: low-latency writes in steady state, and zero data loss for planned migrations.
+
+### 4. Justification for Patroni as an Additional Tool
+
+**Q: Why maintain another tool? Why not write a migration/failover script and expose it through SRE or an existing platform? Oracle has automatic failover but it was never implemented — there must be a good reason.**
+
+A hand-written script would need to independently solve every problem listed in [What a Script Cannot Replicate](#what-a-script-cannot-replicate): fencing, consensus-based leader election, best replica selection, catch-up promotion, node rebuild, and network jitter resilience. Each of these is a complex distributed systems problem. Combining them into a reliable, production-grade script is effectively building Patroni from scratch.
+
+**Key differences from Oracle's situation:**
+
+- Oracle has **Data Guard Broker** — a built-in HA framework with fencing, role management, and automatic failover. The capability already exists natively; choosing not to enable it is a policy decision.
+- PostgreSQL has **no native equivalent**. There is no built-in orchestrator for automatic failover, fencing, or replica promotion coordination. Patroni fills this gap.
+
+**Why not just a script exposed via SRE?**
+
+- A script runs **on demand** — it cannot detect failures or react in real time. Someone must notice the outage, decide to act, and trigger the script. This directly increases RTO.
+- A script has **no state** — it cannot know whether the old primary is truly down, whether a replica is caught up, or whether another operator is running a conflicting action at the same time.
+- Patroni runs **continuously** as a daemon alongside PostgreSQL, monitoring health and holding a distributed lock. This is fundamentally different from a script that runs once and exits.
+
+Patroni is not "another tool" in the same sense as adding a new monitoring system or deployment platform. It is the **missing HA layer** that PostgreSQL does not ship with — comparable to what Oracle already has built in.
