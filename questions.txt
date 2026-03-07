@@ -1,0 +1,8 @@
+1. Cross-DC support and latency concerns
+We don't believe this is supported across data centers. Lev also explained to them yesterday why — there are latency issues involved.
+2. Handling network blips and flapping
+We asked how the system handles momentary network disconnections or jitter. The clusters could start flapping between sites, and we'd run into even more issues — similar to what happened this week with our critical system. Failovers would occur and the application wouldn't handle them gracefully, potentially causing more severe damage than the original issue.
+3. Data loss during failover
+What about data loss? Do we failover at all costs, regardless of potential data loss?
+4. Justification for an additional tool
+What is the benefit of maintaining yet another tool? Why not write a migration/failover script and expose it through our SRE team or through an existing enablement platform? Oracle also has an automatic failover option, but it was never implemented in our environment — and I believe there's a good reason for that.
